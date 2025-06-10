@@ -94,3 +94,130 @@
     (ok true)
   )
 )
+
+;; Pause bridge operations for emergency maintenance
+(define-public (pause-bridge)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-DEPLOYER) (err ERROR-NOT-AUTHORIZED))
+    (var-set bridge-paused true)
+    (ok true)
+  )
+)
+
+;; Resume bridge operations after maintenance
+(define-public (resume-bridge)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-DEPLOYER) (err ERROR-NOT-AUTHORIZED))
+    (asserts! (var-get bridge-paused) (err ERROR-INVALID-BRIDGE-STATUS))
+    (var-set bridge-paused false)
+    (ok true)
+  )
+)
+
+;; Add a new validator to the bridge network
+(define-public (add-validator (validator principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-DEPLOYER) (err ERROR-NOT-AUTHORIZED))
+    (asserts! (is-valid-principal validator)
+      (err ERROR-INVALID-VALIDATOR-ADDRESS)
+    )
+    (map-set validators validator true)
+    (ok true)
+  )
+)
+
+;; Remove a validator from the bridge network
+(define-public (remove-validator (validator principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-DEPLOYER) (err ERROR-NOT-AUTHORIZED))
+    (asserts! (is-valid-principal validator)
+      (err ERROR-INVALID-VALIDATOR-ADDRESS)
+    )
+    (map-set validators validator false)
+    (ok true)
+  )
+)
+
+;; BRIDGE CORE FUNCTIONS
+
+;; Initiate a Bitcoin deposit into the bridge
+(define-public (initiate-deposit
+    (tx-hash (buff 32))
+    (amount uint)
+    (recipient principal)
+    (btc-sender (buff 33))
+  )
+  (begin
+    (asserts! (not (var-get bridge-paused)) (err ERROR-BRIDGE-PAUSED))
+    (asserts! (validate-deposit-amount amount) (err ERROR-INVALID-AMOUNT))
+    (asserts! (get-validator-status tx-sender) (err ERROR-NOT-AUTHORIZED))
+    (asserts! (is-valid-tx-hash tx-hash) (err ERROR-INVALID-TX-HASH))
+    (asserts! (is-none (map-get? deposits { tx-hash: tx-hash }))
+      (err ERROR-ALREADY-PROCESSED)
+    )
+    (asserts! (is-valid-principal recipient)
+      (err ERROR-INVALID-RECIPIENT-ADDRESS)
+    )
+    (asserts! (is-valid-btc-address btc-sender) (err ERROR-INVALID-BTC-ADDRESS))
+    (let ((validated-deposit {
+        amount: amount,
+        recipient: recipient,
+        processed: false,
+        confirmations: u0,
+        timestamp: stacks-block-height,
+        btc-sender: btc-sender,
+      }))
+      (map-set deposits { tx-hash: tx-hash } validated-deposit)
+      (ok true)
+    )
+  )
+)
+
+;; Confirm a Bitcoin deposit with validator signature
+(define-public (confirm-deposit
+    (tx-hash (buff 32))
+    (signature (buff 65))
+  )
+  (let (
+      (deposit (unwrap! (map-get? deposits { tx-hash: tx-hash })
+        (err ERROR-INVALID-BRIDGE-STATUS)
+      ))
+      (is-validator (get-validator-status tx-sender))
+    )
+    (asserts! (not (var-get bridge-paused)) (err ERROR-BRIDGE-PAUSED))
+    (asserts! is-validator (err ERROR-NOT-AUTHORIZED))
+    (asserts! (is-valid-tx-hash tx-hash) (err ERROR-INVALID-TX-HASH))
+    (asserts! (is-valid-signature signature) (err ERROR-INVALID-SIGNATURE-FORMAT))
+    (asserts! (not (get processed deposit)) (err ERROR-ALREADY-PROCESSED))
+    (asserts! (>= (get confirmations deposit) REQUIRED-CONFIRMATIONS)
+      (err ERROR-INVALID-BRIDGE-STATUS)
+    )
+    (asserts!
+      (is-none (map-get? validator-signatures {
+        tx-hash: tx-hash,
+        validator: tx-sender,
+      }))
+      (err ERROR-ALREADY-PROCESSED)
+    )
+    (let ((validated-signature {
+        signature: signature,
+        timestamp: stacks-block-height,
+      }))
+      (map-set validator-signatures {
+        tx-hash: tx-hash,
+        validator: tx-sender,
+      }
+        validated-signature
+      )
+      (map-set deposits { tx-hash: tx-hash } (merge deposit { processed: true }))
+      (map-set bridge-balances (get recipient deposit)
+        (+ (default-to u0 (map-get? bridge-balances (get recipient deposit)))
+          (get amount deposit)
+        ))
+      (var-set total-bridged-amount
+        (+ (var-get total-bridged-amount) (get amount deposit))
+      )
+      (ok true)
+    )
+  )
+)
